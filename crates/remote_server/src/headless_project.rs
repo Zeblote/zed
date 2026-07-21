@@ -309,6 +309,7 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_trust_worktrees);
         session.add_entity_request_handler(Self::handle_restrict_worktrees);
         session.add_entity_request_handler(Self::handle_download_file_by_path);
+        session.add_entity_request_handler(Self::handle_get_project_line_counts);
 
         session.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
         session.add_entity_request_handler(BufferStore::handle_update_buffer);
@@ -808,6 +809,72 @@ impl HeadlessProject {
             file_id
         );
         Ok(proto::DownloadFileResponse { file_id })
+    }
+
+    pub async fn handle_get_project_line_counts(
+        this: Entity<Self>,
+        message: TypedEnvelope<proto::GetProjectLineCounts>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetProjectLineCountsResponse> {
+        let payload = message.payload;
+        let (fs, worktree_store) = this.read_with(&cx, |project, _| {
+            (project.fs.clone(), project.worktree_store.clone())
+        });
+        let worktree = worktree_store
+            .read_with(&cx, |store, cx| {
+                store.worktree_for_id(WorktreeId::from_proto(payload.worktree_id), cx)
+            })
+            .context("no such worktree")?;
+        let snapshot = worktree.read_with(&cx, |worktree, _| worktree.snapshot());
+
+        let entries = cx
+            .background_spawn(async move {
+                let worktree_root = snapshot.abs_path().clone();
+                let valid_paths = payload.reconcile.then(|| {
+                    snapshot
+                        .entries(true, 0)
+                        .filter(|entry| entry.is_file() && !entry.is_fifo)
+                        .map(|entry| entry.path.clone())
+                        .collect()
+                });
+                let candidates = payload
+                    .paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        let relative_path = RelPath::from_unix_str(&path).log_err()?;
+                        project::LineCountCandidate::from_snapshot(
+                            &snapshot,
+                            relative_path.to_owned().into(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                project::count_lines(fs, worktree_root, candidates, valid_paths)
+                    .await
+                    .into_iter()
+                    .map(|entry| {
+                        let (line_count, is_binary) = match entry.count {
+                            Some(worktree::FileLineCount::Text(line_count)) => {
+                                (Some(line_count), false)
+                            }
+                            Some(worktree::FileLineCount::Binary) => (None, true),
+                            None => (None, false),
+                        };
+                        proto::ProjectLineCount {
+                            path: entry.path.as_unix_str().to_owned(),
+                            line_count,
+                            is_binary,
+                            mtime: entry
+                                .fingerprint
+                                .map(|fingerprint| fingerprint.mtime.into()),
+                            size: entry.fingerprint.map_or(0, |fingerprint| fingerprint.size),
+                            inode: entry.fingerprint.map_or(0, |fingerprint| fingerprint.inode),
+                        }
+                    })
+                    .collect()
+            })
+            .await;
+
+        Ok(proto::GetProjectLineCountsResponse { entries })
     }
 
     pub async fn handle_open_new_buffer(

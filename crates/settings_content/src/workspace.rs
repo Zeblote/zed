@@ -820,6 +820,10 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub diagnostic_badges: Option<bool>,
+    /// Whether to show line counts for files and directories in the project panel.
+    ///
+    /// Default: false
+    pub line_counts: Option<bool>,
     /// Whether to show a git status indicator next to file names in the project panel.
     ///
     /// Default: false

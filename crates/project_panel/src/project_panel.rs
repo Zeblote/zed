@@ -1,3 +1,4 @@
+mod line_count_cache;
 pub mod project_panel_settings;
 mod undo;
 mod utils;
@@ -33,9 +34,10 @@ use language::DiagnosticSeverity;
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use notifications::status_toast::StatusToast;
+use num_format::{Locale, ToFormattedString};
 use project::{
-    Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, Project, ProjectEntryId,
-    ProjectPath, Worktree, WorktreeId,
+    Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, PathChange, Project, ProjectEntryId,
+    ProjectPath, UpdatedEntriesSet, Worktree, WorktreeId,
     git_store::{GitStoreEvent, RepositoryEvent, git_traversal::ChildEntriesGitIter},
     project_settings::GoToDiagnosticSeverityFilter,
 };
@@ -86,6 +88,7 @@ use zed_actions::{
 };
 
 use crate::{
+    line_count_cache::{LineCountCache, LineCountRequest},
     project_panel_settings::ProjectPanelScrollbarProxy,
     undo::{Change, UndoManager},
 };
@@ -156,6 +159,14 @@ pub struct ProjectPanel {
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
     diagnostic_summary_update: Task<()>,
+    line_counts: LineCountCache,
+    line_count_generation: u64,
+    line_count_scan_task: Task<()>,
+    // `Some` while `refresh_line_counts` is rebuilding the cache on the
+    // background executor; worktree updates arriving in that window are
+    // buffered here and replayed once the rebuilt cache is swapped in, so they
+    // aren't lost to the swap.
+    line_count_refresh_buffer: Option<Vec<(WorktreeId, UpdatedEntriesSet)>>,
     // We keep track of the mouse down state on entries so we don't flash the UI
     // in case a user clicks to open a file.
     mouse_down: bool,
@@ -284,6 +295,7 @@ struct EntryDetails {
     filename_text_color: Color,
     diagnostic_severity: Option<DiagnosticSeverity>,
     diagnostic_count: Option<DiagnosticCount>,
+    line_count: Option<u64>,
     git_status: GitSummary,
     is_private: bool,
     worktree_id: WorktreeId,
@@ -743,12 +755,19 @@ impl ProjectPanel {
                     }
                     project::Event::WorktreeRemoved(id) => {
                         this.state.expanded_dir_ids.remove(id);
+                        this.line_counts.remove_worktree(*id);
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
-                    project::Event::WorktreeUpdatedEntries(_, _)
-                    | project::Event::WorktreeAdded(_)
-                    | project::Event::WorktreeOrderChanged => {
+                    project::Event::WorktreeUpdatedEntries(worktree_id, changes) => {
+                        this.update_line_counts(*worktree_id, changes, cx);
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                    project::Event::WorktreeAdded(_) | project::Event::WorktreeOrderChanged => {
+                        if ProjectPanelSettings::get_global(cx).line_counts {
+                            this.refresh_line_counts(cx);
+                        }
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
@@ -831,6 +850,16 @@ impl ProjectPanel {
                     if project_panel_settings.sticky_scroll && !new_settings.sticky_scroll {
                         this.sticky_items_count = 0;
                     }
+                    if project_panel_settings.line_counts != new_settings.line_counts {
+                        if new_settings.line_counts {
+                            this.refresh_line_counts(cx);
+                        } else {
+                            this.line_count_generation = this.line_count_generation.wrapping_add(1);
+                            this.line_count_scan_task = Task::ready(());
+                            this.line_count_refresh_buffer = None;
+                            this.line_counts.clear();
+                        }
+                    }
                     project_panel_settings = new_settings;
                     this.update_diagnostics(cx);
                     cx.notify();
@@ -858,6 +887,10 @@ impl ProjectPanel {
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
+                line_counts: Default::default(),
+                line_count_generation: 0,
+                line_count_scan_task: Task::ready(()),
+                line_count_refresh_buffer: None,
                 scroll_handle,
                 mouse_down: false,
                 hover_expand_task: None,
@@ -883,6 +916,9 @@ impl ProjectPanel {
                 ),
             };
             this.update_visible_entries(None, false, false, window, cx);
+            if ProjectPanelSettings::get_global(cx).line_counts {
+                this.refresh_line_counts(cx);
+            }
 
             this
         });
@@ -1038,6 +1074,206 @@ impl ProjectPanel {
             } else {
                 Default::default()
             };
+    }
+
+    fn refresh_line_counts(&mut self, cx: &mut Context<Self>) {
+        if !self.project.read(cx).supports_line_counts() {
+            return;
+        }
+        self.line_count_generation = self.line_count_generation.wrapping_add(1);
+        let generation = self.line_count_generation;
+        self.line_counts.clear();
+        self.line_count_refresh_buffer = Some(Vec::new());
+
+        let snapshots = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).snapshot())
+            .collect::<Vec<_>>();
+        self.line_count_scan_task = cx.spawn(async move |this, cx| {
+            let (cache, requests, reconcile_worktrees) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut cache = LineCountCache::default();
+                    let mut requests = Vec::new();
+                    let mut reconcile_worktrees = Vec::with_capacity(snapshots.len());
+                    for snapshot in &snapshots {
+                        reconcile_worktrees.push(snapshot.id());
+                        requests
+                            .extend(cache.reset_worktree(snapshot.id(), snapshot.entries(true, 0)));
+                    }
+                    (cache, requests, reconcile_worktrees)
+                })
+                .await;
+            let load = this.update(cx, |this, cx| {
+                if this.line_count_generation != generation {
+                    return None;
+                }
+                this.line_counts = cache;
+                for worktree_id in &reconcile_worktrees {
+                    if this
+                        .project
+                        .read(cx)
+                        .worktree_for_id(*worktree_id, cx)
+                        .is_none()
+                    {
+                        this.line_counts.remove_worktree(*worktree_id);
+                    }
+                }
+                for (worktree_id, changes) in
+                    this.line_count_refresh_buffer.take().unwrap_or_default()
+                {
+                    this.update_line_counts(worktree_id, &changes, cx);
+                }
+                Some(this.load_line_counts(requests, reconcile_worktrees, generation, cx))
+            });
+            if let Ok(Some(load)) = load {
+                load.await;
+            }
+        });
+    }
+
+    fn update_line_counts(
+        &mut self,
+        worktree_id: WorktreeId,
+        changes: &UpdatedEntriesSet,
+        cx: &mut Context<Self>,
+    ) {
+        if !ProjectPanelSettings::get_global(cx).line_counts
+            || !self.project.read(cx).supports_line_counts()
+        {
+            return;
+        }
+        if let Some(buffer) = self.line_count_refresh_buffer.as_mut() {
+            buffer.push((worktree_id, changes.clone()));
+            return;
+        }
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            self.line_counts.remove_worktree(worktree_id);
+            return;
+        };
+        let snapshot = worktree.read(cx).snapshot();
+        let mut requests = Vec::new();
+        let mut reconcile = false;
+        for (path, entry_id, change) in changes.iter() {
+            if *change == PathChange::Removed {
+                self.line_counts.remove_subtree(worktree_id, path);
+                reconcile = true;
+            } else if let Some(entry) = snapshot.entry_for_id(*entry_id) {
+                if let Some(request) = self.line_counts.mark_pending(worktree_id, entry) {
+                    requests.push(request);
+                }
+            } else {
+                self.line_counts.remove(worktree_id, path);
+            }
+        }
+        if !requests.is_empty() || reconcile {
+            self.load_line_counts(
+                requests,
+                reconcile.then_some(worktree_id).into_iter().collect(),
+                self.line_count_generation,
+                cx,
+            )
+            .detach();
+        }
+    }
+
+    fn load_line_counts(
+        &self,
+        requests: Vec<LineCountRequest>,
+        reconcile_worktrees: Vec<WorktreeId>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            const BATCH_SIZE: usize = 256;
+            const MAX_ATTEMPTS: usize = 3;
+            let reconcile_worktrees = reconcile_worktrees.into_iter().collect::<HashSet<_>>();
+            let mut requests_by_worktree: HashMap<WorktreeId, Vec<LineCountRequest>> =
+                HashMap::default();
+            for worktree_id in &reconcile_worktrees {
+                requests_by_worktree.entry(*worktree_id).or_default();
+            }
+            for request in requests {
+                requests_by_worktree
+                    .entry(request.worktree_id)
+                    .or_default()
+                    .push(request);
+            }
+
+            for (worktree_id, worktree_requests) in requests_by_worktree {
+                let batch_count = worktree_requests.len().div_ceil(BATCH_SIZE).max(1);
+                for batch_index in 0..batch_count {
+                    let start = batch_index * BATCH_SIZE;
+                    let end = (start + BATCH_SIZE).min(worktree_requests.len());
+                    let batch = worktree_requests[start..end].to_vec();
+                    let reconcile = batch_index == 0 && reconcile_worktrees.contains(&worktree_id);
+                    let paths = batch
+                        .iter()
+                        .map(|request| request.path.clone())
+                        .collect::<Vec<_>>();
+                    let mut attempt = 0;
+                    let results = loop {
+                        attempt += 1;
+                        let load_task = project.read_with(cx, |project, cx| {
+                            project
+                                .worktree_for_id(worktree_id, cx)
+                                .is_some()
+                                .then(|| project.line_counts(worktree_id, paths.clone(), reconcile, cx))
+                        });
+                        // A removed worktree is not an error; just drop its
+                        // remaining requests.
+                        let Some(load_task) = load_task else {
+                            break None;
+                        };
+                        match load_task.await {
+                            Ok(results) => break Some(results),
+                            Err(error) if attempt < MAX_ATTEMPTS => {
+                                log::warn!(
+                                    "failed to load project line counts (attempt {attempt}): {error:#}"
+                                );
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(50 * (1 << (attempt - 1))))
+                                    .await;
+                            }
+                            Err(error) => {
+                                Err::<(), _>(error)
+                                    .notify_workspace_async_err(workspace.clone(), cx);
+                                break None;
+                            }
+                        }
+                    };
+                    let Some(results) = results else {
+                        break;
+                    };
+                    let mut results = results
+                        .into_iter()
+                        .map(|result| (result.path.clone(), result))
+                        .collect::<HashMap<_, _>>();
+                    if this
+                        .update(cx, |this, cx| {
+                            if this.line_count_generation != generation {
+                                return;
+                            }
+                            let mut changed = false;
+                            for request in &batch {
+                                let result = results.remove(&request.path);
+                                changed |= this.line_counts.apply(request, result.as_ref());
+                            }
+                            if changed {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
     }
 
     fn update_strongest_diagnostic_severity(
@@ -5623,6 +5859,7 @@ impl ProjectPanel {
         let filename_text_color = details.filename_text_color;
         let diagnostic_severity = details.diagnostic_severity;
         let diagnostic_count = details.diagnostic_count;
+        let line_count = details.line_count;
         let item_colors = get_item_color(is_sticky, cx);
 
         let canonical_path = details.canonical_path.clone();
@@ -6070,6 +6307,7 @@ impl ProjectPanel {
                     .when(
                         canonical_path.is_some()
                             || diagnostic_count.is_some()
+                            || line_count.is_some()
                             || git_indicator.is_some(),
                         |this| {
                             let symlink_element = canonical_path.map(|path| {
@@ -6128,6 +6366,15 @@ impl ProjectPanel {
                                         this.child(git_indicator)
                                     })
                                     .when_some(symlink_element, |this, el| this.child(el))
+                                    .when_some(line_count, |this, line_count| {
+                                        this.child(
+                                            Label::new(
+                                                line_count.to_formatted_string(&Locale::en),
+                                            )
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                        )
+                                    })
                                     .into_any_element(),
                             )
                         },
@@ -6476,9 +6723,15 @@ impl ProjectPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EntryDetails {
-        let (show_file_icons, show_folder_icons) = {
+        let (show_file_icons, show_folder_icons, show_line_counts, hide_ignored, hide_hidden) = {
             let settings = ProjectPanelSettings::get_global(cx);
-            (settings.file_icons, settings.folder_icons)
+            (
+                settings.file_icons,
+                settings.folder_icons,
+                settings.line_counts,
+                settings.hide_gitignore,
+                settings.hide_hidden,
+            )
         };
 
         let expanded_entry_ids = self
@@ -6542,6 +6795,13 @@ impl ProjectPanel {
             .get(&(worktree_id, entry.path.clone()))
             .copied();
 
+        let line_count = if show_line_counts {
+            self.line_counts
+                .line_count(worktree_id, entry, hide_ignored, hide_hidden)
+        } else {
+            None
+        };
+
         let filename_text_color =
             entry_git_aware_label_color(git_status, entry.is_ignored, is_marked);
 
@@ -6567,6 +6827,7 @@ impl ProjectPanel {
             filename_text_color,
             diagnostic_severity,
             diagnostic_count,
+            line_count,
             git_status,
             is_private: entry.is_private,
             worktree_id,

@@ -9,6 +9,7 @@ pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
 pub mod image_store;
+mod line_count_store;
 pub mod lsp_command;
 pub mod lsp_store;
 pub mod manifest_tree;
@@ -82,6 +83,7 @@ use futures::{
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
+pub use line_count_store::{LineCountCandidate, count_lines};
 
 use ::git::{blame::Blame, status::FileStatus};
 use gpui::{
@@ -145,9 +147,9 @@ use util::{
 };
 use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
-    Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
-    UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
-    discover_root_repo_common_dir,
+    Entry, EntryKind, FS_WATCH_LATENCY, File, FileLineCount, LocalWorktree, PathChange,
+    ProjectEntryId, UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId,
+    WorktreeSettings, discover_root_repo_common_dir,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
@@ -920,6 +922,20 @@ enum EntitySubscription {
 pub struct DirectoryItem {
     pub path: PathBuf,
     pub is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectLineCount {
+    pub path: Arc<RelPath>,
+    pub count: Option<FileLineCount>,
+    pub fingerprint: Option<ProjectLineCountFingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectLineCountFingerprint {
+    pub mtime: MTime,
+    pub size: u64,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4948,6 +4964,85 @@ impl Project {
             })
         } else {
             Task::ready(Err(anyhow!("cannot list directory in remote project")))
+        }
+    }
+
+    /// Whether `line_counts` can produce results for this project. Collab
+    /// projects have no access to the remote filesystem, so line counts are
+    /// unsupported there.
+    pub fn supports_line_counts(&self) -> bool {
+        self.is_local() || self.is_via_remote_server()
+    }
+
+    pub fn line_counts(
+        &self,
+        worktree_id: WorktreeId,
+        paths: Vec<Arc<RelPath>>,
+        reconcile: bool,
+        cx: &App,
+    ) -> Task<Result<Vec<ProjectLineCount>>> {
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return Task::ready(Err(anyhow!("no such worktree")));
+        };
+
+        if worktree.read(cx).is_local() {
+            let snapshot = worktree.read(cx).snapshot();
+            let fs = self.fs.clone();
+            cx.background_spawn(async move {
+                let worktree_root = snapshot.abs_path().clone();
+                let candidates = paths
+                    .into_iter()
+                    .filter_map(|path| LineCountCandidate::from_snapshot(&snapshot, path))
+                    .collect::<Vec<_>>();
+                let valid_paths = reconcile.then(|| {
+                    snapshot
+                        .entries(true, 0)
+                        .filter(|entry| entry.is_file() && !entry.is_fifo)
+                        .map(|entry| entry.path.clone())
+                        .collect()
+                });
+                Ok(count_lines(fs, worktree_root, candidates, valid_paths).await)
+            })
+        } else if let Some(remote) = self.remote_client.as_ref() {
+            let response = remote
+                .read(cx)
+                .proto_client()
+                .request(proto::GetProjectLineCounts {
+                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    worktree_id: worktree_id.to_proto(),
+                    paths: paths
+                        .iter()
+                        .map(|path| path.as_unix_str().to_owned())
+                        .collect(),
+                    reconcile,
+                });
+            cx.background_spawn(async move {
+                response
+                    .await?
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        let path: Arc<RelPath> = RelPath::from_unix_str(&entry.path)?.into();
+                        let count = if entry.is_binary {
+                            Some(FileLineCount::Binary)
+                        } else {
+                            entry.line_count.map(FileLineCount::Text)
+                        };
+                        let fingerprint = entry.mtime.map(|mtime| ProjectLineCountFingerprint {
+                            mtime: mtime.into(),
+                            size: entry.size,
+                            inode: entry.inode,
+                        });
+                        Ok(ProjectLineCount {
+                            path,
+                            count,
+                            fingerprint,
+                        })
+                    })
+                    .collect()
+            })
+        } else {
+            Task::ready(Err(anyhow!("cannot load line counts for this project")))
         }
     }
 

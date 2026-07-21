@@ -37,6 +37,7 @@ pub struct ProjectPanelSettings {
     pub sort_mode: ProjectPanelSortMode,
     pub sort_order: ProjectPanelSortOrder,
     pub diagnostic_badges: bool,
+    pub line_counts: bool,
     pub git_status_indicator: bool,
 }
 
@@ -144,6 +145,7 @@ impl Settings for ProjectPanelSettings {
             sort_mode: project_panel.sort_mode.unwrap(),
             sort_order: project_panel.sort_order.unwrap(),
             diagnostic_badges: project_panel.diagnostic_badges.unwrap(),
+            line_counts: project_panel.line_counts.unwrap(),
             git_status_indicator: project_panel.git_status_indicator.unwrap(),
         }
     }

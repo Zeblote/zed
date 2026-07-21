@@ -894,6 +894,8 @@
     "sort_order": "default",
     // Whether to show error and warning count badges next to file names in the project panel.
     "diagnostic_badges": false,
+    // Whether to show line counts for files and directories in the project panel.
+    "line_counts": false,
     // Whether to show the git status indicator next to file names in the project panel.
     "git_status_indicator": false,
     // Whether to enable drag-and-drop operations in the project panel.

@@ -59,6 +59,26 @@ message GetPathMetadataResponse {
   bool is_dir = 3;
 }
 
+message GetProjectLineCounts {
+  uint64 project_id = 1;
+  uint64 worktree_id = 2;
+  repeated string paths = 3;
+  bool reconcile = 4;
+}
+
+message ProjectLineCount {
+  string path = 1;
+  optional uint64 line_count = 2;
+  bool is_binary = 3;
+  Timestamp mtime = 4;
+  uint64 size = 5;
+  uint64 inode = 6;
+}
+
+message GetProjectLineCountsResponse {
+  repeated ProjectLineCount entries = 1;
+}
+
 message WorktreeMetadata {
   uint64 id = 1;
   string root_name = 2;

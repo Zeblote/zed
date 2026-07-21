@@ -58,6 +58,7 @@ use std::{
     ffi::OsStr,
     fmt,
     future::Future,
+    io::Read as _,
     mem::{self},
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
@@ -118,6 +119,174 @@ pub struct LoadedFile {
 pub struct LoadedBinaryFile {
     pub file: Arc<File>,
     pub content: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLineCount {
+    Text(u64),
+    Binary,
+}
+
+pub async fn count_file_lines(fs: &dyn Fs, abs_path: &Path) -> Result<FileLineCount> {
+    let file = fs
+        .open_sync(abs_path)
+        .await
+        .with_context(|| format!("opening file {abs_path:?}"))?;
+    count_file_lines_from_reader(file, abs_path)
+}
+
+fn count_file_lines_from_reader(
+    mut file: impl std::io::Read,
+    abs_path: &Path,
+) -> Result<FileLineCount> {
+    let mut prefix = Vec::with_capacity(FILE_ANALYSIS_BYTES);
+    let mut buffer = [0; FILE_ANALYSIS_BYTES];
+    while prefix.len() < FILE_ANALYSIS_BYTES {
+        let bytes_read = file
+            .read(&mut buffer[..FILE_ANALYSIS_BYTES - prefix.len()])
+            .with_context(|| format!("reading file {abs_path:?}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&buffer[..bytes_read]);
+    }
+
+    let byte_content = analyze_byte_content(&prefix);
+    let mut contents = std::io::Cursor::new(prefix).chain(file);
+    let mut newline_count = 0u64;
+    let mut read_buffer = [0; 64 * 1024];
+    match byte_content {
+        ByteContent::Utf16Le | ByteContent::Utf16Be => {
+            let mut pending_byte = None;
+            loop {
+                let bytes_read = contents
+                    .read(&mut read_buffer)
+                    .with_context(|| format!("reading file {abs_path:?}"))?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let mut index = 0;
+                if let Some(first_byte) = pending_byte.take() {
+                    let code_unit = if byte_content == ByteContent::Utf16Le {
+                        u16::from_le_bytes([first_byte, read_buffer[0]])
+                    } else {
+                        u16::from_be_bytes([first_byte, read_buffer[0]])
+                    };
+                    newline_count = newline_count
+                        .checked_add(u64::from(code_unit == b'\n' as u16))
+                        .context("line count overflow")?;
+                    index = 1;
+                }
+
+                let pairs_end = index + (bytes_read - index) / 2 * 2;
+                for pair in read_buffer[index..pairs_end].chunks_exact(2) {
+                    let code_unit = if byte_content == ByteContent::Utf16Le {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    } else {
+                        u16::from_be_bytes([pair[0], pair[1]])
+                    };
+                    newline_count = newline_count
+                        .checked_add(u64::from(code_unit == b'\n' as u16))
+                        .context("line count overflow")?;
+                }
+                pending_byte = (pairs_end < bytes_read).then(|| read_buffer[pairs_end]);
+            }
+        }
+        ByteContent::Unknown => loop {
+            let bytes_read = contents
+                .read(&mut read_buffer)
+                .with_context(|| format!("reading file {abs_path:?}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+            let newlines = read_buffer[..bytes_read]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as u64;
+            newline_count = newline_count
+                .checked_add(newlines)
+                .context("line count overflow")?;
+        },
+        ByteContent::Binary => return Ok(FileLineCount::Binary),
+    }
+
+    Ok(FileLineCount::Text(
+        newline_count
+            .checked_add(1)
+            .context("line count overflow")?,
+    ))
+}
+
+#[cfg(test)]
+mod line_count_tests {
+    use super::*;
+
+    #[test]
+    fn counts_text_file_lines() -> Result<()> {
+        assert_eq!(
+            count_file_lines_from_reader(std::io::Cursor::new(b""), Path::new("empty"))?,
+            FileLineCount::Text(1)
+        );
+        assert_eq!(
+            count_file_lines_from_reader(std::io::Cursor::new(b"one"), Path::new("one"))?,
+            FileLineCount::Text(1)
+        );
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(b"one\r\ntwo\n"),
+                Path::new("lines")
+            )?,
+            FileLineCount::Text(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn counts_utf16_file_lines() -> Result<()> {
+        let mut little_endian = vec![0xff, 0xfe];
+        little_endian.extend("one\ntwo".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(little_endian),
+                Path::new("utf16-le")
+            )?,
+            FileLineCount::Text(2)
+        );
+
+        let mut big_endian = vec![0xfe, 0xff];
+        big_endian.extend("one\ntwo".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(
+            count_file_lines_from_reader(std::io::Cursor::new(big_endian), Path::new("utf16-be"))?,
+            FileLineCount::Text(2)
+        );
+
+        let line_repetitions = 64 * 1024;
+        let full_buffer_text = "a\n".repeat(line_repetitions);
+        let mut full_buffer_little_endian = vec![0xff, 0xfe];
+        full_buffer_little_endian
+            .extend(full_buffer_text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(full_buffer_little_endian),
+                Path::new("full-buffer-utf16-le")
+            )?,
+            FileLineCount::Text(line_repetitions as u64 + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_binary_files() -> Result<()> {
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(b"\x89PNG\r\n\x1a\ncontents"),
+                Path::new("image.png")
+            )?,
+            FileLineCount::Binary
+        );
+        Ok(())
+    }
 }
 
 impl fmt::Debug for LoadedBinaryFile {
