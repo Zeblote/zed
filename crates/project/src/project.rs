@@ -9,6 +9,7 @@ pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
 pub mod image_store;
+mod line_count_store;
 pub mod lsp_command;
 pub mod lsp_store;
 pub mod manifest_tree;
@@ -83,6 +84,7 @@ use futures::{
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
+pub use line_count_store::count_lines;
 
 use ::git::{blame::Blame, status::FileStatus};
 use gpui::{
@@ -146,9 +148,9 @@ use util::{
 };
 use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
-    Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
-    UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
-    discover_root_repo_common_dir,
+    Entry, EntryKind, FS_WATCH_LATENCY, File, FileLineCount, LocalWorktree, PathChange,
+    ProjectEntryId, UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId,
+    WorktreeSettings, discover_root_repo_common_dir,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
@@ -963,6 +965,20 @@ enum EntitySubscription {
 pub struct DirectoryItem {
     pub path: PathBuf,
     pub is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectLineCount {
+    pub path: Arc<RelPath>,
+    pub count: Option<FileLineCount>,
+    pub fingerprint: Option<ProjectLineCountFingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectLineCountFingerprint {
+    pub mtime: MTime,
+    pub size: u64,
+    pub inode: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5120,6 +5136,93 @@ impl Project {
             })
         } else {
             Task::ready(Err(anyhow!("cannot list directory in remote project")))
+        }
+    }
+
+    /// Whether `line_counts` can produce results for this project. Collab
+    /// projects have no access to the remote filesystem, so line counts are
+    /// unsupported there.
+    pub fn supports_line_counts(&self) -> bool {
+        self.is_local() || self.is_via_remote_server()
+    }
+
+    pub fn line_counts(
+        &self,
+        worktree_id: WorktreeId,
+        paths: Vec<Arc<RelPath>>,
+        cx: &App,
+    ) -> futures::stream::BoxStream<'static, Result<Vec<ProjectLineCount>>> {
+        use futures::TryStreamExt as _;
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return futures::stream::once(async { Err(anyhow!("no such worktree")) }).boxed();
+        };
+        if worktree.read(cx).is_local() {
+            count_lines(
+                self.fs.clone(),
+                worktree.read(cx).snapshot(),
+                paths,
+                cx.background_executor(),
+            )
+        } else if let Some(remote) = self.remote_client.as_ref() {
+            static NEXT_REQUEST: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let request_id = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let client = remote.read(cx).proto_client().clone();
+            let response = client.request_stream(proto::GetProjectLineCounts {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                worktree_id: worktree_id.to_proto(),
+                paths: paths
+                    .iter()
+                    .map(|path| path.as_unix_str().to_owned())
+                    .collect(),
+                request_id,
+            });
+            let cancel = util::defer(move || {
+                client
+                    .send(proto::CancelProjectLineCounts {
+                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        request_id,
+                    })
+                    .log_err();
+            });
+            futures::stream::once(async move {
+                let stream = response.await?;
+                Ok::<_, anyhow::Error>(
+                    stream
+                        .map(move |response| {
+                            let _cancel_on_drop = &cancel;
+                            response?
+                                .entries
+                                .into_iter()
+                                .map(|entry| {
+                                    Ok(ProjectLineCount {
+                                        path: RelPath::from_unix_str(&entry.path)?.into(),
+                                        count: if entry.is_binary {
+                                            Some(FileLineCount::Binary)
+                                        } else {
+                                            entry.line_count.map(FileLineCount::Text)
+                                        },
+                                        fingerprint: entry.mtime.map(|mtime| {
+                                            ProjectLineCountFingerprint {
+                                                mtime: mtime.into(),
+                                                size: entry.size,
+                                                inode: entry.inode,
+                                            }
+                                        }),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .boxed(),
+                )
+            })
+            .try_flatten()
+            .boxed()
+        } else {
+            futures::stream::once(async {
+                Err(anyhow!("cannot load line counts for this project"))
+            })
+            .boxed()
         }
     }
 

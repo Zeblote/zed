@@ -128,6 +128,237 @@ pub struct LoadedBinaryFile {
     pub content: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLineCount {
+    Text(u64),
+    Binary,
+}
+
+pub async fn count_file_lines(fs: &dyn Fs, abs_path: &Path) -> Result<FileLineCount> {
+    static READS: std::sync::LazyLock<Arc<async_lock::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(async_lock::Semaphore::new(16)));
+    let permit = READS.acquire_arc().await;
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = util::defer({
+        let cancelled = cancelled.clone();
+        move || cancelled.store(true, std::sync::atomic::Ordering::Relaxed)
+    });
+    let file = fs
+        .open_sync(abs_path)
+        .await
+        .with_context(|| format!("opening file {abs_path:?}"))?;
+    let owned_path = abs_path.to_path_buf();
+    smol::unblock(move || {
+        // Keep the permit until the blocking read actually stops, even if its future is dropped.
+        let _permit = permit;
+        count_file_lines_from_reader(CancellableLineReader { file, cancelled }, &owned_path)
+    })
+    .await
+}
+
+struct CancellableLineReader<R> {
+    file: R,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R: std::io::Read> std::io::Read for CancellableLineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("line counting cancelled"));
+        }
+        self.file.read(buffer)
+    }
+}
+
+fn count_file_lines_from_reader(
+    mut file: impl std::io::Read,
+    abs_path: &Path,
+) -> Result<FileLineCount> {
+    let mut prefix = Vec::with_capacity(FILE_ANALYSIS_BYTES);
+    let mut buffer = [0; FILE_ANALYSIS_BYTES];
+    while prefix.len() < FILE_ANALYSIS_BYTES {
+        let bytes_read = file
+            .read(&mut buffer[..FILE_ANALYSIS_BYTES - prefix.len()])
+            .with_context(|| format!("reading file {abs_path:?}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&buffer[..bytes_read]);
+    }
+
+    let byte_content = match encoding_rs::Encoding::for_bom(&prefix) {
+        Some((encoding, _)) if encoding == encoding_rs::UTF_16LE => ByteContent::Utf16Le,
+        Some((encoding, _)) if encoding == encoding_rs::UTF_16BE => ByteContent::Utf16Be,
+        _ => analyze_byte_content(&prefix),
+    };
+    let mut contents = std::io::Cursor::new(prefix).chain(file);
+    let mut newline_count = 0u64;
+    let mut read_buffer = [0; 64 * 1024];
+    match byte_content {
+        ByteContent::Utf16Le | ByteContent::Utf16Be => {
+            let newline = if byte_content == ByteContent::Utf16Le {
+                [b'\n', 0]
+            } else {
+                [0, b'\n']
+            };
+            let mut pending_byte = None;
+            loop {
+                let bytes_read = contents
+                    .read(&mut read_buffer)
+                    .with_context(|| format!("reading file {abs_path:?}"))?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let mut index = 0;
+                let mut newlines = 0;
+                if let Some(first_byte) = pending_byte.take() {
+                    newlines += u64::from([first_byte, read_buffer[0]] == newline);
+                    index = 1;
+                }
+
+                let pairs_end = index + (bytes_read - index) / 2 * 2;
+                newlines += read_buffer[index..pairs_end]
+                    .chunks_exact(2)
+                    .filter(|pair| *pair == newline)
+                    .count() as u64;
+                newline_count = newline_count
+                    .checked_add(newlines)
+                    .context("line count overflow")?;
+                pending_byte = (pairs_end < bytes_read).then(|| read_buffer[pairs_end]);
+            }
+        }
+        ByteContent::Unknown => loop {
+            let bytes_read = contents
+                .read(&mut read_buffer)
+                .with_context(|| format!("reading file {abs_path:?}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+            let newlines = memchr::memchr_iter(b'\n', &read_buffer[..bytes_read]).count() as u64;
+            newline_count = newline_count
+                .checked_add(newlines)
+                .context("line count overflow")?;
+        },
+        ByteContent::Binary => return Ok(FileLineCount::Binary),
+    }
+
+    Ok(FileLineCount::Text(
+        newline_count
+            .checked_add(1)
+            .context("line count overflow")?,
+    ))
+}
+
+#[cfg(test)]
+mod line_count_tests {
+    use super::*;
+
+    #[test]
+    fn counts_text_file_lines() -> Result<()> {
+        assert_eq!(
+            count_file_lines_from_reader(std::io::Cursor::new(b""), Path::new("empty"))?,
+            FileLineCount::Text(1)
+        );
+        assert_eq!(
+            count_file_lines_from_reader(std::io::Cursor::new(b"one"), Path::new("one"))?,
+            FileLineCount::Text(1)
+        );
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(b"one\r\ntwo\n"),
+                Path::new("lines")
+            )?,
+            FileLineCount::Text(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn counts_utf16_file_lines() -> Result<()> {
+        let mut little_endian = vec![0xff, 0xfe];
+        little_endian.extend("one\ntwo".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(little_endian),
+                Path::new("utf16-le")
+            )?,
+            FileLineCount::Text(2)
+        );
+
+        let mut big_endian = vec![0xfe, 0xff];
+        big_endian.extend("one\ntwo".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(
+            count_file_lines_from_reader(std::io::Cursor::new(big_endian), Path::new("utf16-be"))?,
+            FileLineCount::Text(2)
+        );
+
+        let line_repetitions = 64 * 1024;
+        let full_buffer_text = "a\n".repeat(line_repetitions);
+        let mut full_buffer_little_endian = vec![0xff, 0xfe];
+        full_buffer_little_endian
+            .extend(full_buffer_text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(full_buffer_little_endian),
+                Path::new("full-buffer-utf16-le")
+            )?,
+            FileLineCount::Text(line_repetitions as u64 + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn honors_utf16_boms_without_ascii_prefixes() -> Result<()> {
+        for little_endian in [false, true] {
+            let mut bytes = if little_endian {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for code_unit in "上".repeat(1000).encode_utf16() {
+                bytes.extend(if little_endian {
+                    code_unit.to_le_bytes()
+                } else {
+                    code_unit.to_be_bytes()
+                });
+            }
+            assert_eq!(
+                count_file_lines_from_reader(std::io::Cursor::new(bytes), Path::new("cjk"))?,
+                FileLineCount::Text(1)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_reader_stops_before_more_io() -> Result<()> {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reader = CancellableLineReader {
+            file: std::io::Cursor::new(b"one\ntwo"),
+            cancelled: cancelled.clone(),
+        };
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte)?, 1);
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(std::io::Read::read(&mut reader, &mut byte).is_err());
+        assert_eq!(reader.file.position(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_binary_files() -> Result<()> {
+        assert_eq!(
+            count_file_lines_from_reader(
+                std::io::Cursor::new(b"\x89PNG\r\n\x1a\ncontents"),
+                Path::new("image.png")
+            )?,
+            FileLineCount::Binary
+        );
+        Ok(())
+    }
+}
+
 impl fmt::Debug for LoadedBinaryFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoadedBinaryFile")

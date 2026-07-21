@@ -73,6 +73,7 @@ pub struct HeadlessProject {
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
+    line_count_cancellations: HashMap<u64, futures::channel::oneshot::Sender<()>>,
 }
 
 pub struct HeadlessAppState {
@@ -311,6 +312,8 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_trust_worktrees);
         session.add_entity_request_handler(Self::handle_restrict_worktrees);
         session.add_entity_request_handler(Self::handle_download_file_by_path);
+        session.add_entity_stream_request_handler(Self::handle_get_project_line_counts);
+        session.add_entity_message_handler(Self::handle_cancel_project_line_counts);
 
         session.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
         session.add_entity_request_handler(BufferStore::handle_update_buffer);
@@ -361,6 +364,7 @@ impl HeadlessProject {
             profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
+            line_count_cancellations: Default::default(),
         }
     }
 
@@ -867,6 +871,91 @@ impl HeadlessProject {
             file_id
         );
         Ok(proto::DownloadFileResponse { file_id })
+    }
+
+    pub async fn handle_get_project_line_counts(
+        this: Entity<Self>,
+        message: TypedEnvelope<proto::GetProjectLineCounts>,
+        mut cx: AsyncApp,
+    ) -> Result<impl futures::Stream<Item = Result<proto::GetProjectLineCountsResponse>>> {
+        use futures::StreamExt as _;
+        let payload = message.payload;
+        let request_id = payload.request_id;
+        let (cancel, cancelled) = futures::channel::oneshot::channel();
+        let (fs, worktree_store) = this.update(&mut cx, |project, _| {
+            project.line_count_cancellations.insert(request_id, cancel);
+            (project.fs.clone(), project.worktree_store.clone())
+        });
+        let weak = this.downgrade();
+        let cleanup = util::defer({
+            let mut cx = cx.clone();
+            move || {
+                weak.update(&mut cx, |project, _| {
+                    project.line_count_cancellations.remove(&request_id);
+                })
+                .log_err();
+            }
+        });
+        let worktree = worktree_store
+            .read_with(&cx, |store, cx| {
+                store.worktree_for_id(WorktreeId::from_proto(payload.worktree_id), cx)
+            })
+            .context("no such worktree")?;
+        let snapshot = worktree.read_with(&cx, |worktree, _| worktree.snapshot());
+        let paths = payload
+            .paths
+            .into_iter()
+            .map(|path| Ok(RelPath::from_unix_str(&path)?.to_owned().into()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(
+            project::count_lines(fs, snapshot, paths, cx.background_executor())
+                .take_until(cancelled)
+                .map(move |entries| {
+                    let _cleanup_on_drop = &cleanup;
+                    Ok(proto::GetProjectLineCountsResponse {
+                        entries: entries?
+                            .into_iter()
+                            .map(|entry| {
+                                let (line_count, is_binary) = match entry.count {
+                                    Some(worktree::FileLineCount::Text(lines)) => {
+                                        (Some(lines), false)
+                                    }
+                                    Some(worktree::FileLineCount::Binary) => (None, true),
+                                    None => (None, false),
+                                };
+                                proto::ProjectLineCount {
+                                    path: entry.path.as_unix_str().to_owned(),
+                                    line_count,
+                                    is_binary,
+                                    mtime: entry
+                                        .fingerprint
+                                        .map(|fingerprint| fingerprint.mtime.into()),
+                                    size: entry
+                                        .fingerprint
+                                        .map_or(0, |fingerprint| fingerprint.size),
+                                    inode: entry
+                                        .fingerprint
+                                        .map_or(0, |fingerprint| fingerprint.inode),
+                                }
+                            })
+                            .collect(),
+                    })
+                }),
+        )
+    }
+
+    async fn handle_cancel_project_line_counts(
+        this: Entity<Self>,
+        message: TypedEnvelope<proto::CancelProjectLineCounts>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        this.update(&mut cx, |project, _| {
+            // Dropping the sender wakes take_until even when the last read is still pending.
+            project
+                .line_count_cancellations
+                .remove(&message.payload.request_id);
+        });
+        Ok(())
     }
 
     pub async fn handle_open_new_buffer(

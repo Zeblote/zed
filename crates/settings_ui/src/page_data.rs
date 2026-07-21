@@ -5338,7 +5338,7 @@ fn window_and_layout_page() -> SettingsPage {
 }
 
 fn panels_page() -> SettingsPage {
-    fn project_panel_section() -> [SettingsPageItem; 30] {
+    fn project_panel_section() -> [SettingsPageItem; 33] {
         [
             SettingsPageItem::SectionHeader("Project Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5796,6 +5796,75 @@ fn panels_page() -> SettingsPage {
                             .project_panel
                             .get_or_insert_default()
                             .diagnostic_badges = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Line Counts",
+                description: "Show line counts for files and the total line count of their descendants for directories.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("project_panel.line_counts"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project_panel
+                            .as_ref()?
+                            .line_counts
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project_panel
+                            .get_or_insert_default()
+                            .line_counts = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Line Count Included Extensions",
+                description: "Comma-separated file extensions to count lines for. When empty, every file is counted.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("project_panel.line_count_included_extensions"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project_panel
+                            .as_ref()?
+                            .line_count_included_extensions
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project_panel
+                            .get_or_insert_default()
+                            .line_count_included_extensions = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Line Count Excluded Extensions",
+                description: "Comma-separated file extensions to never count lines for. Takes precedence over the included extensions.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("project_panel.line_count_excluded_extensions"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project_panel
+                            .as_ref()?
+                            .line_count_excluded_extensions
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project_panel
+                            .get_or_insert_default()
+                            .line_count_excluded_extensions = value;
                     },
                 }),
                 metadata: None,

@@ -880,6 +880,9 @@ impl VsCodeSettings {
             sticky_scroll: None,
             auto_open: None,
             diagnostic_badges: None,
+            line_counts: None,
+            line_count_included_extensions: None,
+            line_count_excluded_extensions: None,
             git_status_indicator: None,
         };
 

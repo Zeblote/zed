@@ -909,6 +909,20 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub diagnostic_badges: Option<bool>,
+    /// Whether to show line counts for files and directories in the project panel.
+    ///
+    /// Default: false
+    pub line_counts: Option<bool>,
+    /// Comma-separated file extensions to count lines for. When empty, every
+    /// file is counted.
+    ///
+    /// Default: ""
+    pub line_count_included_extensions: Option<String>,
+    /// Comma-separated file extensions to never count lines for. Takes
+    /// precedence over the included extensions.
+    ///
+    /// Default: ""
+    pub line_count_excluded_extensions: Option<String>,
     /// Whether to show a git status indicator next to file names in the project panel.
     ///
     /// Default: false

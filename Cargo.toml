@@ -682,6 +682,7 @@ lru = "0.16"
 lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "f1783e63a7f4eb4397bf51d4148b4895a1f7ab16" }
 mach2 = "0.5"
 markup5ever_rcdom = "0.39"
+memchr = "2.8"
 metal = "0.33"
 mime = "0.3.17"
 minidumper = "0.11"
